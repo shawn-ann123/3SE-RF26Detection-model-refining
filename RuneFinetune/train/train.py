@@ -4,7 +4,8 @@
 - 用 model-0624.onnx 的权重初始化（全量微调），断点续训
 - 损失：类别 BCE(pos_weight) 全锚点 + 关键点 conf BCE(pos_weight) 全锚点
         + 关键点 xy MSE（仅正样本锚点，权重 --kpt-weight）
-- 目标分配：每个实例按 point_R（索引 2）所在网格单元分配到全部 3 个尺度
+- 目标分配：按类别分派尺度（class 0/1/2 -> stride 8/16/32），
+  每个实例按 point_R（索引 2）所在网格单元落到对应尺度；每帧每类最多一个对象
 - 验证：损失 + 像素误差 / PCK@10 / PCK@20 / 类别命中率
         （单符帧用最高分锚点；多符帧每个对象贪心匹配同类别最近锚点）
 
@@ -56,10 +57,14 @@ def pick_device(pref):
 
 
 def build_targets(objs_batch, device):
-    """objs_batch: list[b] -> list[(cls_id, kpts [5,2] np)]"""
+    """objs_batch: list[b] -> list[(cls_id, kpts [5,2] np)]
+
+    按类别分派尺度：cls_id 即尺度索引（0->stride 8, 1->stride 16, 2->stride 32）。
+    每个锚点单元只能表示一个关键点组，同类别目标共享 R 中心单元，因此每帧每类最多保留一个对象。
+    """
     b = len(objs_batch)
     targets = []
-    for stride in STRIDES:
+    for cls_scale, stride in enumerate(STRIDES):
         h, w = NET_H // stride, NET_W // stride
         cls_t = torch.zeros(b, NUM_CLASSES, h, w, device=device)
         kpt_xy_t = torch.zeros(b, NUM_KEYPOINTS, 2, h, w, device=device)
@@ -67,6 +72,8 @@ def build_targets(objs_batch, device):
         mask = torch.zeros(b, NUM_KEYPOINTS, h, w, dtype=torch.bool, device=device)
         for bi, objs in enumerate(objs_batch):
             for cls_id, kpts in objs:
+                if cls_id != cls_scale:
+                    continue
                 kpts = torch.as_tensor(kpts, dtype=torch.float32, device=device)
                 pr = kpts[2]
                 gx = min(int(pr[0] / stride), w - 1)
@@ -94,7 +101,10 @@ def compute_loss(outs, targets, pos_weight, kpt_weight):
         l_cls = bce_cls(cls_raw, cls_t)
         l_conf = bce_conf(kpt_conf, conf_t)
         mask_xy = mask.unsqueeze(2).expand_as(kpt_xy)
-        l_kpt = mse(kpt_xy[mask_xy], kpt_xy_t[mask_xy])
+        if mask.any():
+            l_kpt = mse(kpt_xy[mask_xy], kpt_xy_t[mask_xy])
+        else:
+            l_kpt = kpt_xy.sum() * 0.0  # 该尺度本 batch 无正样本（空集 MSE 会得 NaN）
         total = total + l_cls + l_conf + kpt_weight * l_kpt
         for k, v in (("cls", l_cls), ("conf", l_conf), ("kpt", l_kpt)):
             parts[k] = parts.get(k, 0.0) + v.item()
@@ -114,10 +124,10 @@ def decode_best(out):
 
 
 def match_multi(dec_bi, objs, radius=32.0):
-    """多对象帧：为每个 GT 对象在其 point_R 半径内找 quality 最高的预测锚点。
+    """多对象帧：每个 GT 对象只在其类别对应尺度的锚点里，按 point_R 半径找 quality 最高的预测。
 
-    与单符帧 decode_best 同口径（quality = cls_conf * mean(kpt_conf)），
-    即"该符附近模型实际会响应的最强锚点"。
+    与 build_targets 的按类别分派尺度一致（class 0/1/2 -> scale 0/1/2）。
+    quality = cls_conf * mean(kpt_conf)，即"该符附近模型实际会响应的最强锚点"。
     返回 [(gt_cls, gt_kpts, pred_cls, xy[5,2])]，只含半径内存在候选的对象；
     调用方按 pred_cls == gt_cls 决定是否计入命中。
     """
@@ -128,15 +138,22 @@ def match_multi(dec_bi, objs, radius=32.0):
     conf = cls[best_cls, torch.arange(cls.shape[1])]
     quality = conf * kc.mean(dim=0)
     pred_pr = xy[2]
+    scale_bounds = []
+    start = 0
+    for stride in STRIDES:
+        n = (NET_H // stride) * (NET_W // stride)
+        scale_bounds.append((start, start + n))
+        start += n
     out = []
-    for gi, (gt_cls, gt_kpts) in enumerate(objs):
+    for gt_cls, gt_kpts in objs:
         gt = torch.as_tensor(gt_kpts, dtype=torch.float32)
-        d = (pred_pr - gt[2].unsqueeze(1)).norm(dim=0)
-        q = quality.clone()
+        lo, hi = scale_bounds[gt_cls]
+        d = (pred_pr[:, lo:hi] - gt[2].unsqueeze(1)).norm(dim=0)
+        q = quality[lo:hi].clone()
         q[d > radius] = -1.0
         if (q > -1.0).sum() == 0:
             continue
-        j = int(torch.argmax(q))
+        j = int(torch.argmax(q)) + lo
         out.append((gt_cls, gt_kpts, int(best_cls[j]), xy[:, :, j]))
     return out
 

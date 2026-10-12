@@ -5,7 +5,7 @@
 file 相对标签文件所在目录解析。
 
 关键点顺序（已与用户确认）：0=top(绿) 1=left(黄) 2=point_R(蓝) 3=right(品红) 4=bottom(红)
-水平翻转时左右点交换索引 1<->3。
+水平翻转：叶片/亮叶交换 1<->3；三叉戟（class 2）交换 1<->3 与 0<->4。
 """
 
 import json
@@ -66,13 +66,18 @@ def hsv_jitter(img_rgb, h_gain=0.015, s_gain=0.4, v_gain=0.4):
 
 
 def apply_flip(img_rgb, objects):
-    """水平翻转；关键点 x -> NET_W-1-x，索引 1(left) 与 3(right) 互换"""
+    """水平翻转；关键点 x -> NET_W-1-x。
+
+    镜像索引交换：叶片/亮叶 1(left)<->3(right)；三叉戟（class 2）横杠两端 1<->3、叉尖两端 0<->4。
+    """
     img_rgb = img_rgb[:, ::-1].copy()
     out_objs = []
     for cls_id, kpts in objects:
         kpts = kpts.copy()
         kpts[:, 0] = NET_W - 1 - kpts[:, 0]
         kpts[[1, 3]] = kpts[[3, 1]]
+        if cls_id == 2:
+            kpts[[0, 4]] = kpts[[4, 0]]
         out_objs.append((cls_id, kpts))
     return img_rgb, out_objs
 
