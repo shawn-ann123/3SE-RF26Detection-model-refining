@@ -1,0 +1,14 @@
+标注数据
+xdg-open tools/labeler.html
+模型训练
+cd /home/shawn/桌面/usaa/RuneFinetune/train
+../.venv-xpu/bin/python train.py --train-labels ../data/runeset/labels.jsonl
+| 参数 | 默认 | 说明 |
+| --- | --- | --- |
+| --train-labels | 必填 | 标注文件路径 |
+| --epochs | 60 | 训练轮数 |
+| --batch | 8 | 批大小 |
+| --device | auto | 自动选 xpu；也可显式 xpu / cpu |
+| --weights | weights/model-0624.onnx | 预训练权重；传 '' 则随机初始化 |
+| --resume | 无 | 从 last.pt 断点续训 |
+| --out | 自动 | 输出目录，默认 train/runs/train_时间戳/ |

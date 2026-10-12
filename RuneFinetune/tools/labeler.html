@@ -1,0 +1,443 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>能量机关 5 点标注工具</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    font-family: sans-serif; margin: 0; padding: 8px; background: #222; color: #eee;
+    display: flex; flex-direction: column;
+  }
+  h1 { font-size: 16px; margin: 0 0 6px; }
+  .bar { margin: 0 0 6px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; flex-shrink: 0; }
+  .btn {
+    padding: 6px 12px; background: #444; border: 1px solid #666; border-radius: 4px;
+    cursor: pointer; color: #eee; display: inline-block; font-size: 14px; user-select: none;
+  }
+  .btn:hover { background: #555; }
+  button.btn { font-family: inherit; }
+  #info { font-size: 13px; margin: 0 0 4px; flex-shrink: 0; }
+  .hint { color: #aaa; font-size: 12px; margin: 0 0 6px; flex-shrink: 0; }
+  #wrap {
+    flex: 1 1 auto; min-height: 66vh; overflow: hidden; border: 1px solid #555;
+    background: #111; position: relative; cursor: crosshair;
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+  #objects {
+    font-size: 12px; color: #9f9; white-space: pre-wrap; flex-shrink: 0;
+    max-height: 44px; overflow: auto; margin-top: 4px;
+  }
+</style>
+</head>
+<body>
+<h1>能量机关 5 点标注工具（坐标保存在 640x480 网络输入空间）</h1>
+
+<div class="bar">
+  <label class="btn" for="folderInput">1. 选择图片文件夹</label>
+  <input type="file" id="folderInput" webkitdirectory directory multiple style="display:none">
+  <label class="btn" for="filesInput">或选多个图片文件</label>
+  <input type="file" id="filesInput" multiple accept="image/*" style="display:none">
+  <label class="btn" for="labelsInput">载入已有 labels.jsonl（续标）</label>
+  <input type="file" id="labelsInput" accept=".jsonl,.json" style="display:none">
+  <label>缩放
+    <select id="zoom">
+      <option value="fit" selected>适应窗口</option>
+      <option value="0.5">0.5x</option>
+      <option value="1">1x</option>
+      <option value="2">2x</option>
+      <option value="3">3x</option>
+      <option value="4">4x</option>
+      <option value="8">8x</option>
+      <option value="16">16x</option>
+      <option value="32">32x</option>
+      <option value="custom">滚轮自定义</option>
+    </select>
+  </label>
+  <label style="font-size:13px"><input type="checkbox" id="cross" checked> 十字线(x)</label>
+  <button class="btn" onclick="prevImage()">上一张</button>
+  <button class="btn" onclick="nextImage()">下一张</button>
+  <button class="btn" onclick="exportJSONL()">2. 导出 labels.jsonl</button>
+</div>
+
+<div class="bar">
+  <span>类别（按键 0/1/2 或点击）：</span>
+  <button class="btn" id="c0" onclick="setClass(0)">0 未激活</button>
+  <button class="btn" id="c1" onclick="setClass(1)">1 小符已激活</button>
+  <button class="btn" id="c2" onclick="setClass(2)">2 大符已激活</button>
+  <span id="clsShow" style="font-weight:bold;color:#ff8">未选类别</span>
+  <button class="btn" onclick="undoPoint()">撤销上一点(u)</button>
+  <button class="btn" onclick="clearObj()">清空当前对象</button>
+  <button class="btn" onclick="delObj()">删除本图最后一个对象</button>
+</div>
+
+<div id="info">未选择图片（支持直接拖拽文件夹或图片到本页面）</div>
+<div class="hint">滚轮：以鼠标为中心缩放（最大 32x 像素级）｜左键拖动：平移图片（无限画布，右键/中键也可拖动）｜原地单击左键：标注一个实心小点｜+/- 缩放，x 开关十字线，f 适应窗口居中</div>
+<div id="wrap"><canvas id="cv"></canvas></div>
+<div id="objects"></div>
+
+<script>
+const NET_W = 640, NET_H = 480;
+const KPT_COLORS = ["#00ff00", "#ffff00", "#00aaff", "#ff00ff", "#ff0000"];
+const KPT_NAMES = ["0 top", "1 left", "2 R中心", "3 right", "4 bottom"];
+const MIN_ZOOM = 0.2, MAX_ZOOM = 32;
+
+let files = [];           // 图片 File 列表
+let idx = -1;             // 当前图片索引
+let img = null;           // 当前 HTMLImageElement
+let curClass = -1;
+let curPts = [];          // 当前未保存对象的点
+let savedObjs = {};       // fileName -> [{class_id, keypoints}]
+let existing = {};        // 从 labels.jsonl 载入的已有标注
+let zoomMode = "fit";     // "fit" 或数字
+let lastZoom = 1;         // 最近一次 redraw 使用的缩放
+let panX = 0, panY = 0;   // 图像左上角在画布上的偏移（像素）
+let lastMouse = null;     // [x, y] 画布内逻辑坐标
+let down = null;          // 鼠标按下状态
+
+const cv = document.getElementById("cv");
+const ctx = cv.getContext("2d");
+const wrap = document.getElementById("wrap");
+
+const zoomSel = document.getElementById("zoom");
+zoomSel.onchange = e => {
+  const v = e.target.value;
+  if (v === "custom") return;
+  zoomMode = v === "fit" ? "fit" : +v;
+  centerImage();
+  redraw();
+};
+document.getElementById("cross").onchange = e => { crosshair = e.target.checked; redraw(); };
+let crosshair = true;
+
+function getZoom() {
+  if (zoomMode !== "fit") return zoomMode;
+  const z = Math.min(wrap.clientWidth / NET_W, wrap.clientHeight / NET_H) * 0.98;
+  return Math.max(0.2, Math.floor(z * 100) / 100);
+}
+function setManualZoom(z) {
+  zoomMode = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, z));
+  zoomSel.value = "custom";
+}
+// 无限画布：平移不做边界限制，图像可拖到视口任意位置（f 键重置回适应窗口居中）
+function centerImage() {
+  const z = getZoom();
+  panX = (wrap.clientWidth - NET_W * z) / 2;
+  panY = (wrap.clientHeight - NET_H * z) / 2;
+}
+
+document.getElementById("folderInput").addEventListener("change", e => {
+  loadFiles([...e.target.files]);
+});
+document.getElementById("filesInput").addEventListener("change", e => {
+  loadFiles([...e.target.files]);
+});
+document.getElementById("labelsInput").addEventListener("change", e => {
+  const r = new FileReader();
+  r.onload = () => {
+    for (const line of r.result.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const rec = JSON.parse(line);
+        existing[rec.file] = rec.objects;
+      } catch (_) {}
+    }
+    alert("已载入 " + Object.keys(existing).length + " 张已有标注");
+    redraw();
+  };
+  r.readAsText(e.target.files[0]);
+});
+
+function loadFiles(list) {
+  const imgs = list.filter(f => /\.(png|jpe?g|ppm|bmp)$/i.test(f.name));
+  if (imgs.length === 0) {
+    alert("没有找到图片文件（支持 png/jpg/ppm/bmp）");
+    return;
+  }
+  files = imgs.sort((a, b) => a.name.localeCompare(b.name));
+  idx = -1;
+  nextImage();
+}
+
+// 拖拽支持：文件夹或图片直接拖进页面
+document.addEventListener("dragover", e => e.preventDefault());
+document.addEventListener("drop", async e => {
+  e.preventDefault();
+  const out = [];
+  const items = [...e.dataTransfer.items];
+  for (const item of items) {
+    if (item.kind !== "file") continue;
+    const entry = item.webkitGetAsEntry ? item.webkitGetAsEntry() : null;
+    if (entry && entry.isDirectory) {
+      await walkDir(entry, out);
+    } else {
+      const f = item.getAsFile();
+      if (f) out.push(f);
+    }
+  }
+  if (items.length === 0 && e.dataTransfer.files.length > 0) {
+    out.push(...e.dataTransfer.files);
+  }
+  loadFiles(out);
+});
+function walkDir(entry, out) {
+  return new Promise(resolve => {
+    const reader = entry.createReader();
+    const readAll = () => {
+      reader.readEntries(async ents => {
+        if (ents.length === 0) { resolve(); return; }
+        for (const en of ents) {
+          if (en.isDirectory) await walkDir(en, out);
+          else out.push(new Promise(res => en.file(res)));
+        }
+        readAll();
+      });
+    };
+    readAll();
+  }).then(async () => {
+    for (let i = 0; i < out.length; i++) {
+      if (out[i] instanceof Promise) out[i] = await out[i];
+    }
+  });
+}
+
+function nextImage() {
+  if (curPts.length === 5) saveObj();
+  if (idx >= 0) savedObjs[files[idx].name] = savedObjs[files[idx].name] || [];
+  if (files.length === 0) return;
+  idx = Math.min(idx + 1, files.length - 1);
+  loadCurrent();
+}
+function prevImage() {
+  if (curPts.length === 5) saveObj();
+  if (files.length === 0) return;
+  idx = Math.max(idx - 1, 0);
+  loadCurrent();
+}
+function loadCurrent() {
+  const f = files[idx];
+  curPts = [];
+  curClass = existing[f.name] && existing[f.name].length > 0 ? existing[f.name][0].class_id : -1;
+  updateClsShow();
+  const im = new Image();
+  im.onload = () => { img = im; centerImage(); redraw(); };
+  im.src = URL.createObjectURL(f);
+}
+function setClass(c) {
+  curClass = c;
+  updateClsShow();
+  redraw();
+}
+function updateClsShow() {
+  const el = document.getElementById("clsShow");
+  el.textContent = curClass >= 0 ? ["0 未激活", "1 小符已激活", "2 大符已激活"][curClass] : "未选类别";
+  el.style.color = curClass >= 0 ? "#9f9" : "#ff8";
+}
+function undoPoint() { curPts.pop(); redraw(); }
+function clearObj() { curPts = []; redraw(); }
+function delObj() {
+  const a = savedObjs[files[idx].name] || [];
+  a.pop();
+  savedObjs[files[idx].name] = a;
+  redraw();
+}
+
+function imgToScreen(p) {
+  return [p[0] * lastZoom - panX, p[1] * lastZoom - panY];
+}
+function screenToImg(sx, sy) {
+  return [(sx + panX) / lastZoom, (sy + panY) / lastZoom];
+}
+
+// 实心小点标注：r 为逻辑像素半径，越小越精确
+function drawPt(p, color, r, label) {
+  const [x, y] = imgToScreen(p);
+  if (x < -20 || y < -20 || x > wrap.clientWidth + 20 || y > wrap.clientHeight + 20) return;
+  ctx.strokeStyle = "rgba(0,0,0,0.9)";
+  ctx.lineWidth = 1;
+  ctx.fillStyle = color;
+  ctx.beginPath(); ctx.arc(x, y, r, 0, 7); ctx.fill(); ctx.stroke();
+  if (label) {
+    ctx.fillStyle = "rgba(0,0,0,0.8)";
+    const tw = ctx.measureText(label).width + 4;
+    ctx.fillRect(x + r + 2, y - r - 14, tw, 14);
+    ctx.fillStyle = "#fff";
+    ctx.font = "11px sans-serif";
+    ctx.textBaseline = "middle";
+    ctx.fillText(label, x + r + 4, y - r - 7);
+  }
+}
+function drawCross() {
+  if (!crosshair || !lastMouse || !img) return;
+  const [mx, my] = lastMouse;
+  const [ix, iy] = screenToImg(mx, my);
+  if (ix < 0 || iy < 0 || ix > NET_W || iy > NET_H) return;
+  ctx.strokeStyle = "rgba(255,255,255,0.85)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(mx - 14, my); ctx.lineTo(mx + 14, my);
+  ctx.moveTo(mx, my - 14); ctx.lineTo(mx, my + 14);
+  ctx.stroke();
+}
+
+function redraw() {
+  if (!img || idx < 0) return;
+  const dpr = window.devicePixelRatio || 1;
+  const w = wrap.clientWidth, h = wrap.clientHeight;
+  if (cv.width !== Math.round(w * dpr) || cv.height !== Math.round(h * dpr)) {
+    cv.width = Math.round(w * dpr);
+    cv.height = Math.round(h * dpr);
+  }
+  lastZoom = getZoom();
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = "#111";
+  ctx.fillRect(0, 0, w, h);
+  ctx.imageSmoothingEnabled = false;   // 像素级放大显示像素格
+  ctx.drawImage(img, -panX, -panY, NET_W * lastZoom, NET_H * lastZoom);
+
+  const all = (savedObjs[files[idx].name] || []).concat(
+    (existing[files[idx].name] || []).map(o => ({...o, old: true})));
+  for (const obj of all) {
+    obj.keypoints.forEach(p => drawPt(p, obj.old ? "#888" : KPT_COLORS[obj.class_id] || "#fff", 2, null));
+  }
+  curPts.forEach((p, i) => drawPt(p, KPT_COLORS[i], 3, KPT_NAMES[i]));
+  drawCross();
+
+  let cursor = "";
+  if (lastMouse) {
+    const [ix, iy] = screenToImg(lastMouse[0], lastMouse[1]);
+    if (ix >= 0 && iy >= 0 && ix <= NET_W && iy <= NET_H) {
+      cursor = `  | 光标像素 (${Math.floor(ix)}, ${Math.floor(iy)})`;
+    }
+  }
+  document.getElementById("info").textContent =
+    `[${idx + 1}/${files.length}] ${files[idx].name}  | 缩放 ${lastZoom.toFixed(2)}x  | 本图对象 ${(savedObjs[files[idx].name]||[]).length}${(existing[files[idx].name]||[]).length ? " +载入"+(existing[files[idx].name]||[]).length : ""}  | 当前对象点数 ${curPts.length}/5  | 类别 ${curClass >= 0 ? curClass : "未选"}` + cursor;
+  document.getElementById("objects").textContent =
+    "本图对象: " + JSON.stringify((savedObjs[files[idx].name]||[]).concat(existing[files[idx].name]||[]).map(o => ({class_id: o.class_id, keypoints: o.keypoints.map(p => [Math.round(p[0]*10)/10, Math.round(p[1]*10)/10])})));
+}
+
+// 滚轮：以鼠标位置为中心缩放
+cv.addEventListener("wheel", e => {
+  e.preventDefault();
+  if (!img) return;
+  const r = cv.getBoundingClientRect();
+  const mx = e.clientX - r.left, my = e.clientY - r.top;
+  const [ix, iy] = screenToImg(mx, my);
+  const steps = Math.min(Math.abs(e.deltaY), 120) / 40;
+  const factor = Math.pow(1.15, -Math.sign(e.deltaY) * steps);
+  const nz = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, lastZoom * factor));
+  if (nz === lastZoom) return;
+  setManualZoom(nz);
+  // 保持鼠标所指图像像素在缩放前后屏幕位置不变：pan = 图像点*新zoom - 鼠标屏幕位置
+  panX = ix * nz - mx;
+  panY = iy * nz - my;
+  lastMouse = [mx, my];
+  redraw();
+}, {passive: false});
+
+// 左键：原地单击 = 标点；拖动超过阈值 = 平移。右键/中键拖动 = 平移。
+cv.addEventListener("mousedown", e => {
+  if (!img) return;
+  down = {x: e.clientX, y: e.clientY, btn: e.button, moved: false, panX0: panX, panY0: panY};
+  e.preventDefault();
+});
+cv.addEventListener("mousemove", e => {
+  if (!img) return;
+  const r = cv.getBoundingClientRect();
+  const mx = e.clientX - r.left, my = e.clientY - r.top;
+  if (down) {
+    const dx = e.clientX - down.x, dy = e.clientY - down.y;
+    if (!down.moved && Math.hypot(dx, dy) > 4) down.moved = true;
+    if (down.moved) {
+      panX = down.panX0 - dx;
+      panY = down.panY0 - dy;
+    }
+  }
+  lastMouse = [mx, my];
+  redraw();
+});
+cv.addEventListener("mouseup", e => {
+  if (down && !down.moved && down.btn === 0 && curPts.length < 5) {
+    const r = cv.getBoundingClientRect();
+    const [x, y] = screenToImg(e.clientX - r.left, e.clientY - r.top);
+    if (x >= 0 && y >= 0 && x <= NET_W && y <= NET_H) {
+      curPts.push([Math.round(x * 10) / 10, Math.round(y * 10) / 10]);
+      if (curPts.length === 5) saveObj();
+      redraw();
+    }
+  }
+  down = null;
+});
+cv.addEventListener("mouseleave", () => { down = null; lastMouse = null; redraw(); });
+cv.addEventListener("contextmenu", e => e.preventDefault());
+
+function saveObj() {
+  if (curClass < 0) { alert("先选类别（按键 0/1/2）再确认对象"); return; }
+  if (!savedObjs[files[idx].name]) savedObjs[files[idx].name] = [];
+  savedObjs[files[idx].name].push({ class_id: curClass, keypoints: curPts.map(p => [p[0], p[1]]) });
+  curPts = [];
+  redraw();
+}
+
+document.addEventListener("keydown", e => {
+  if (e.target.tagName === "SELECT" || e.target.tagName === "INPUT") return;
+  if (e.key === "Enter") { if (curPts.length === 5) saveObj(); }
+  else if (e.key === "0") setClass(0);
+  else if (e.key === "1") setClass(1);
+  else if (e.key === "2") setClass(2);
+  else if (e.key === "n") nextImage();
+  else if (e.key === "p") prevImage();
+  else if (e.key === "u") undoPoint();
+  else if (e.key === "+" || e.key === "=") zoomBy(1.25);
+  else if (e.key === "-") zoomBy(1 / 1.25);
+  else if (e.key === "x" || e.key === "X") {
+    crosshair = !crosshair;
+    document.getElementById("cross").checked = crosshair;
+    redraw();
+  }
+  else if (e.key === "f" || e.key === "F") {
+    zoomMode = "fit";
+    zoomSel.value = "fit";
+    centerImage();
+    redraw();
+  }
+});
+function zoomBy(f) {
+  if (!img) return;
+  const nz = Math.min(MAX_ZOOM, Math.max(MIN_ZOOM, lastZoom * f));
+  if (nz === lastZoom) return;
+  const cx = wrap.clientWidth / 2, cy = wrap.clientHeight / 2;
+  const [ix, iy] = screenToImg(cx, cy);
+  setManualZoom(nz);
+  // 键盘缩放围绕视口中心：pan = 图像点*新zoom - 视口中心屏幕位置
+  panX = ix * nz - cx;
+  panY = iy * nz - cy;
+  redraw();
+}
+
+window.addEventListener("resize", () => {
+  if (zoomMode === "fit") centerImage();
+  redraw();
+});
+
+function exportJSONL() {
+  if (curPts.length === 5) saveObj();
+  if (idx >= 0) savedObjs[files[idx].name] = savedObjs[files[idx].name] || [];
+  let out = "";
+  const names = new Set([...Object.keys(existing), ...Object.keys(savedObjs)]);
+  for (const name of [...names].sort()) {
+    const objs = (existing[name] || []).concat(savedObjs[name] || []);
+    if (objs.length === 0) continue;
+    out += JSON.stringify({file: name, objects: objs}) + "\n";
+  }
+  const blob = new Blob([out], {type: "application/json"});
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "labels.jsonl";
+  a.click();
+  alert("已导出 " + out.split("\n").filter(l => l.trim()).length + " 条标注");
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,14 @@
+{
+  "model": "model/model-0624.xml",
+  "input": "../frames",
+  "total_images": 6,
+  "total_detections": 7,
+  "fps_infer": 196.119,
+  "fps_end2end": 50.277,
+  "timing_mean_ms": {
+    "preprocess": 0.735,
+    "infer": 5.099,
+    "postprocess": 0.085,
+    "total": 19.890
+  }
+}

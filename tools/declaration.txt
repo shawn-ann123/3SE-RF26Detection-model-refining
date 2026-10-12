@@ -1,0 +1,20 @@
+用法格式：
+./tools/export_camera_images --out frames --count 10 --format bgr#获取帧
+./tools/switch_rune small    # 切小符（规则驱动旋转）
+./tools/switch_rune large    # 切大符（规则驱动旋转）
+./tools/switch_rune status   # 查看当前各面真值模式（含角度/转速/扇叶激活）
+# 已激活（亮）状态：--activated 指定亮起的扇叶 0-4，缺省五臂全亮
+./tools/switch_rune small-activated --activated 0          # 小符：旋转 + 1 个灯臂亮
+./tools/switch_rune small-activated --activated 0,1,2      # 小符：旋转 + 3 个灯臂亮（逐个亮起的中间状态）
+./tools/switch_rune large-activated --activated 0,1,2,3,4  # 大符：旋转 + 五臂全亮
+./tools/switch_rune large-activated --activated 1,3 --static  # 大符：静止冻结在当前角度 + 1、3 号亮
+# 想要不同角度的静止激活样本：先 small/large 旋转几秒，再 ...-activated --static 冻结
+导出帧例子：
+./tools/export_labeled_frames --out /home/shawn/桌面/usaa/RuneFinetune/data/xxx --count 20 --debug-draw
+自动切换工况和采样例子：
+./sample_workflows --out /home/shawn/桌面/usaa/RuneFinetune/data/runeset --per-roll 24
+./sample_workflows --out DIR --per-roll 24 --dry-run     # 预览 242 工况列表
+./sample_workflows --out DIR --per-roll 24               # 正式采样
+./sample_workflows --out DIR --per-roll 24 --start 100   # 从第 100 个工况续跑
+./sample_workflows --out DIR --per-roll 24 --limit 5     # 只采 5 个工况
+

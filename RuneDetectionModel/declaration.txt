@@ -1,0 +1,1 @@
+source /home/shawn/Downloads/openvino/venv/bin/activate以激活环境：
